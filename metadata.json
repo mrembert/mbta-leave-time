@@ -1,5 +1,5 @@
 {
-  "name": "Red Line Commuter",
+  "name": "MBTA Commuter",
   "description": "Calculates when to leave home to catch the next Alewife-bound Red Line train from Shawmut or Fields Corner stations.",
   "requestFramePermissions": [
     "geolocation"

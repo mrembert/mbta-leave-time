@@ -4,15 +4,16 @@
  */
 
 import { useEffect, useState, useCallback } from 'react';
-import { Train, Clock, MapPin, Settings, RefreshCw, AlertCircle, Plus, Trash2, ChevronDown, ChevronUp, Navigation } from 'lucide-react';
+import { Train, Bus, Clock, MapPin, Settings, RefreshCw, AlertCircle, Plus, Trash2, ChevronDown, ChevronUp, Navigation } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { format, differenceInMinutes, parseISO, subMinutes } from 'date-fns';
-import { fetchRoutes, fetchStops, fetchPredictionsForStop, fetchAllSubwayStops, Route, Stop, Prediction } from './services/mbta';
+import { fetchRoutes, fetchStops, fetchPredictionsForStop, fetchAllStops, Route, Stop, Prediction } from './services/mbta';
 import { calculateDistance, estimateWalkTime } from './utils/geo';
 
 interface StationConfig {
   id: string;
   routeId: string;
+  routeType: number;
   stopId: string;
   directionId: number;
   walkTime: number;
@@ -42,11 +43,28 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<UserSettings>(() => {
     const saved = localStorage.getItem('mbta_commuter_settings');
-    return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        // Migration: add routeType if missing (default to 0 for old subway stations)
+        if (parsed.stations) {
+          parsed.stations = parsed.stations.map((s: any) => ({
+            ...s,
+            routeType: s.routeType ?? 0
+          }));
+        }
+        return parsed;
+      } catch (e) {
+        console.error('Failed to parse settings', e);
+        return DEFAULT_SETTINGS;
+      }
+    }
+    return DEFAULT_SETTINGS;
   });
 
   // Station Picker State
   const [isAdding, setIsAdding] = useState(false);
+  const [routeTypeFilter, setRouteTypeFilter] = useState<number>(0); // 0: Subway, 3: Bus
   const [selectedRoute, setSelectedRoute] = useState<Route | null>(null);
   const [availableStops, setAvailableStops] = useState<Stop[]>([]);
   const [selectedStop, setSelectedStop] = useState<Stop | null>(null);
@@ -88,76 +106,79 @@ export default function App() {
     loadRoutes();
   }, []);
 
-  useEffect(() => {
-    const findClosestStation = async () => {
-      if (settings.stations.length > 0) {
-        setSuggestedStation(null);
-        return;
-      }
+  const findClosestStation = useCallback(async (force: boolean = false) => {
+    if (!force && settings.stations.length > 0) {
+      setSuggestedStation(null);
+      return;
+    }
 
-      setIsLocatingClosest(true);
-      navigator.geolocation.getCurrentPosition(async (position) => {
-        try {
-          const { latitude, longitude } = position.coords;
-          const allStops = await fetchAllSubwayStops();
-          const allRoutes = await fetchRoutes();
+    setIsLocatingClosest(true);
+    navigator.geolocation.getCurrentPosition(async (position) => {
+      try {
+        const { latitude, longitude } = position.coords;
+        const allStops = await fetchAllStops();
+        const allRoutes = await fetchRoutes();
 
-          let closest = null;
-          let minDistance = Infinity;
+        let closest = null;
+        let minDistance = Infinity;
 
-          for (const stop of allStops) {
-            const dist = calculateDistance(latitude, longitude, stop.latitude, stop.longitude);
-            if (dist < minDistance) {
-              minDistance = dist;
-              closest = stop;
-            }
+        for (const stop of allStops) {
+          const dist = calculateDistance(latitude, longitude, stop.latitude, stop.longitude);
+          if (dist < minDistance) {
+            minDistance = dist;
+            closest = stop;
           }
-
-          if (closest) {
-            let routeId = closest.routeIds[0];
-            
-            if (!routeId) {
-              // Fallback: search for this stop in all routes
-              for (const route of allRoutes) {
-                const stops = await fetchStops(route.id);
-                if (stops.some(s => s.id === closest.id)) {
-                  routeId = route.id;
-                  break;
-                }
-              }
-            }
-
-            if (routeId) {
-              const route = allRoutes.find(r => r.id === routeId);
-              if (route) {
-                const walkTime = estimateWalkTime(minDistance);
-                setSuggestedStation({
-                  id: 'suggested',
-                  routeId: route.id,
-                  stopId: closest.id,
-                  directionId: 1, // Default to Northbound/Inbound
-                  walkTime: walkTime,
-                  routeName: route.name,
-                  stopName: closest.name,
-                  directionName: route.directionNames[1] || 'Inbound',
-                  color: route.color
-                });
-              }
-            }
-          }
-        } catch (error) {
-          console.error('Error finding closest station:', error);
-        } finally {
-          setIsLocatingClosest(false);
         }
-      }, (error) => {
-        console.error('Geolocation error:', error);
-        setIsLocatingClosest(false);
-      });
-    };
 
-    findClosestStation();
+        if (closest) {
+          let routeId = closest.routeIds[0];
+          
+          if (!routeId) {
+            // Fallback: search for this stop in all routes
+            // Only search subway/light rail routes to avoid bus route performance issues
+            const subwayRoutes = allRoutes.filter(r => r.type === 0 || r.type === 1);
+            for (const route of subwayRoutes) {
+              const stops = await fetchStops(route.id);
+              if (stops.some(s => s.id === closest.id)) {
+                routeId = route.id;
+                break;
+              }
+            }
+          }
+
+          if (routeId) {
+            const route = allRoutes.find(r => r.id === routeId);
+            if (route) {
+              const walkTime = estimateWalkTime(minDistance);
+              setSuggestedStation({
+                id: 'suggested',
+                routeId: route.id,
+                routeType: route.type,
+                stopId: closest.id,
+                directionId: 1, // Default to Northbound/Inbound
+                walkTime: walkTime,
+                routeName: route.name,
+                stopName: closest.name,
+                directionName: route.directionNames[1] || 'Inbound',
+                color: route.color
+              });
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error finding closest station:', error);
+      } finally {
+        setIsLocatingClosest(false);
+      }
+    }, (error) => {
+      console.error('Geolocation error:', error);
+      setIsLocatingClosest(false);
+    });
   }, [settings.stations.length]);
+
+  useEffect(() => {
+    findClosestStation();
+  }, [findClosestStation]);
 
   useEffect(() => {
     updatePredictions();
@@ -187,6 +208,7 @@ export default function App() {
     const newStation: StationConfig = {
       id: crypto.randomUUID(),
       routeId: selectedRoute.id,
+      routeType: selectedRoute.type,
       stopId: selectedStop.id,
       directionId: selectedDirection,
       walkTime: walkTime,
@@ -290,6 +312,8 @@ export default function App() {
     const targetTrain = catchableTrain || stationPredictions[0];
     const leaveBy = targetTrain ? getLeaveByTime(targetTrain.arrivalTime, station.walkTime) : null;
     const minutesUntilLeave = leaveBy ? differenceInMinutes(leaveBy, new Date()) : null;
+    const isBus = station.routeType === 3;
+    const Icon = isBus ? Bus : Train;
 
     return (
       <motion.div 
@@ -301,7 +325,7 @@ export default function App() {
       >
         <div className="p-4 flex justify-between items-center" style={{ backgroundColor: station.color, color: 'white' }}>
           <div className="flex items-center gap-2">
-            <MapPin size={18} />
+            <Icon size={18} />
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="font-bold text-lg leading-tight">{station.stopName}</h2>
@@ -327,7 +351,7 @@ export default function App() {
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">
-                    {catchableTrain ? 'Catchable Train' : 'Next Train (Missed)'}
+                    {catchableTrain ? `Catchable ${isBus ? 'Bus' : 'Train'}` : `Next ${isBus ? 'Bus' : 'Train'} (Missed)`}
                   </p>
                   <p className="text-3xl font-bold text-gray-900">
                     {targetTrain.arrivalTime ? format(parseISO(targetTrain.arrivalTime), 'h:mm a') : 'Unknown'}
@@ -373,7 +397,7 @@ export default function App() {
                       <div key={p.id} className="flex flex-col">
                         <div className={`flex justify-between items-center text-sm p-1.5 rounded-lg ${isTarget ? 'bg-gray-50 font-bold' : 'text-gray-500'}`}>
                           <div className="flex items-center gap-2">
-                            <Train size={14} style={{ color: station.color }} className={isMissed ? 'opacity-30' : ''} />
+                            <Icon size={14} style={{ color: station.color }} className={isMissed ? 'opacity-30' : ''} />
                             <div className="flex flex-col">
                               <span className={isMissed ? 'line-through opacity-50' : ''}>{station.directionName}</span>
                               {isTarget && <span className="text-[8px] uppercase tracking-tighter text-emerald-600 font-black">Target</span>}
@@ -402,7 +426,7 @@ export default function App() {
             ) : (
               <div className="pt-4 border-t border-gray-100 text-center py-8">
                 <AlertCircle size={24} className="mx-auto text-gray-300 mb-2" />
-                <p className="text-sm text-gray-400">No upcoming trains found</p>
+                <p className="text-sm text-gray-400">No upcoming {isBus ? 'buses' : 'trains'} found</p>
                 <button 
                   onClick={() => updatePredictions()}
                   className="mt-2 text-xs text-blue-500 hover:underline"
@@ -415,7 +439,7 @@ export default function App() {
           ) : (
             <div className="py-8 text-center text-gray-400">
               <AlertCircle size={32} className="mx-auto mb-2 opacity-20" />
-              <p className="text-sm font-medium">No upcoming trains found</p>
+              <p className="text-sm font-medium">No upcoming {isBus ? 'buses' : 'trains'} found</p>
             </div>
           )}
 
@@ -443,6 +467,14 @@ export default function App() {
             <p className="text-[10px] text-gray-400 font-bold uppercase tracking-[0.2em]">Real-time Departures</p>
           </div>
           <div className="flex gap-2">
+            <button 
+              onClick={() => findClosestStation(true)}
+              disabled={isLocatingClosest}
+              className={`p-2.5 rounded-full bg-white shadow-sm border border-gray-100 hover:bg-gray-50 transition-colors text-gray-600 ${isLocatingClosest ? 'animate-pulse text-blue-500' : ''}`}
+              title="Find Closest Station"
+            >
+              <Navigation size={18} />
+            </button>
             <button 
               onClick={updatePredictions}
               className="p-2.5 rounded-full bg-white shadow-sm border border-gray-100 hover:bg-gray-50 transition-colors text-gray-600"
@@ -487,7 +519,9 @@ export default function App() {
                     <div key={station.id} className="flex flex-col p-3 bg-gray-50 rounded-xl border border-gray-100 gap-3">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-3">
-                          <div className="w-2 h-8 rounded-full" style={{ backgroundColor: station.color }} />
+                          <div className="flex items-center justify-center w-8 h-8 rounded-full" style={{ backgroundColor: station.color, color: 'white' }}>
+                            {station.routeType === 3 ? <Bus size={14} /> : <Train size={14} />}
+                          </div>
                           <div>
                             <p className="text-xs font-bold">{station.stopName}</p>
                             <p className="text-[9px] text-gray-400 font-bold uppercase tracking-wider">{station.routeName} • {station.directionName}</p>
@@ -587,22 +621,61 @@ export default function App() {
 
                 <div className="space-y-4">
                   <div className="space-y-1">
-                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Select Line</label>
-                    <div className="grid grid-cols-2 gap-2">
-                      {routes.map(r => (
-                        <button
-                          key={r.id}
-                          onClick={() => setSelectedRoute(r)}
-                          className={`p-3 rounded-xl text-xs font-bold border-2 transition-all ${
-                            selectedRoute?.id === r.id 
-                              ? 'border-black bg-black text-white' 
-                              : 'border-gray-100 bg-gray-50 text-gray-600 hover:border-gray-200'
-                          }`}
-                        >
-                          {r.name}
-                        </button>
-                      ))}
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Select Type</label>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => { setRouteTypeFilter(0); setSelectedRoute(null); }}
+                        className={`flex-1 p-3 rounded-xl text-xs font-bold border-2 transition-all flex items-center justify-center gap-2 ${
+                          routeTypeFilter === 0 
+                            ? 'border-black bg-black text-white' 
+                            : 'border-gray-100 bg-gray-50 text-gray-600 hover:border-gray-200'
+                        }`}
+                      >
+                        <Train size={14} /> Subway
+                      </button>
+                      <button
+                        onClick={() => { setRouteTypeFilter(3); setSelectedRoute(null); }}
+                        className={`flex-1 p-3 rounded-xl text-xs font-bold border-2 transition-all flex items-center justify-center gap-2 ${
+                          routeTypeFilter === 3 
+                            ? 'border-black bg-black text-white' 
+                            : 'border-gray-100 bg-gray-50 text-gray-600 hover:border-gray-200'
+                        }`}
+                      >
+                        <Bus size={14} /> Bus
+                      </button>
                     </div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Select Line</label>
+                    {routeTypeFilter === 0 ? (
+                      <div className="grid grid-cols-2 gap-2">
+                        {routes.filter(r => r.type === 0 || r.type === 1).map(r => (
+                          <button
+                            key={r.id}
+                            onClick={() => setSelectedRoute(r)}
+                            className={`p-3 rounded-xl text-xs font-bold border-2 transition-all ${
+                              selectedRoute?.id === r.id 
+                                ? 'border-black bg-black text-white' 
+                                : 'border-gray-100 bg-gray-50 text-gray-600 hover:border-gray-200'
+                            }`}
+                          >
+                            {r.name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <select 
+                        className="w-full bg-gray-50 border border-gray-200 rounded-xl p-3 text-sm font-bold focus:outline-none"
+                        onChange={(e) => setSelectedRoute(routes.find(r => r.id === e.target.value) || null)}
+                        value={selectedRoute?.id || ''}
+                      >
+                        <option value="">Choose a bus line...</option>
+                        {routes.filter(r => r.type === 3).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true })).map(r => (
+                          <option key={r.id} value={r.id}>{r.name}</option>
+                        ))}
+                      </select>
+                    )}
                   </div>
 
                   {selectedRoute && (
